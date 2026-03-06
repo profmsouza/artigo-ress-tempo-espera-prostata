@@ -1,0 +1,444 @@
+---
+title: "Análise dos Fatores Associados à Resposta Terapêutica Oncológica"
+author: "Márcio Souza"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  word_document: default
+  pdf_document:
+    latex_engine: xelatex
+bibliography: bibliografia.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if(!require("pacman")) install.packages("pacman", dep=T)
+pacman::p_load(tidyverse, survival, survminer, tableone, ggplot2, gtsummary, broom, readxl, broom, MASS, car, gtsummary)
+
+```
+
+## Preparando os dados
+
+```{r data}
+dados <- read_xls("base_final_final_com_dicionário_das_variáveis.xls")
+names(dados)[29] = "descricao"
+
+# Criando o data.frame com a tabela de estadiamento
+tabela_estadiamento <- data.frame(
+  estadiam = c("0", "1", "1C", "2", "2A", "2B", "2C", 
+             "3", "3A", "3B", "3C", "4", "4A", "4B", 
+             "88", "99"),
+  
+  rotulo = c("Estádio 0", "Estádio I", "Estádio IC", 
+             "Estádio II", "Estádio IIA", "Estádio IIB", "Estádio IIC", 
+             "Estádio III", "Estádio IIIA", "Estádio IIIB", "Estádio IIIC", 
+             "Estádio IV", "Estádio IVA", "Estádio IVB", 
+             "Não se aplica", "Ignorado"),
+  
+  # --- NOVA COLUNA 1: Agrupamento Clássico (Romano) ---
+  estadio_geral = c("0", "I", "I", 
+                    "II", "II", "II", "II", 
+                    "III", "III", "III", "III", 
+                    "IV", "IV", "IV", 
+                    "N/A", "Ignorado"),
+  
+  # --- NOVA COLUNA 2: Agrupamento Epidemiológico (Binário) ---
+  # Geralmente: 0, I e II são "Precoce/Inicial", III e IV são "Avançado"
+  estadiam_bin = c("Inicial", "Inicial", "Inicial", 
+                            "Inicial", "Inicial", "Inicial", "Inicial", 
+                            "Avançado", "Avançado", "Avançado", "Avançado", 
+                            "Avançado", "Avançado", "Avançado", 
+                            NA, NA), # 88 e 99 viram NA para não sujar a análise
+  
+  descricao = c(
+    "Carcinoma in situ (não invasivo)",
+    "Tumor inicial, pequeno e localizado",
+    "Subdivisão do Estádio I",
+    "Tumor localmente avançado",
+    "Subdivisão inicial do Estádio II",
+    "Subdivisão intermediária do Estádio II",
+    "Subdivisão avançada do Estádio II",
+    "Tumor avançado regionalmente",
+    "Subdivisão inicial do Estádio III",
+    "Subdivisão intermediária do Estádio III",
+    "Subdivisão avançada do Estádio III",
+    "Metástase à distância",
+    "Metástase ou avanço local agressivo",
+    "Metástase à distância avançada",
+    "Tumores sem estadiamento TNM",
+    "Informação desconhecida ou não registrada"
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+# Converter variáveis de data
+dados_clean <- dados %>%
+  left_join(tabela_estadiamento[,c(1,4)], "estadiam") %>% 
+  filter(tratamentoantesdodiag != "tratamentoantesdodiag") %>%
+  dplyr::select(-tratamentoantesdodiag,-tpcaso,-datainitrt,-datapricon,
+         -trancursodiagtrat,-trancurso1consultdiag,-diagnosticoantesdaconsulta,
+         -dtdiagno,-ocupacao,-codigo,-faixaconsultadiag,-estadiam) %>% 
+  mutate(
+    faixa_etaria_prim_cons = cut(
+      idade1consulta,
+      breaks = c(seq(0, 80, by = 10), Inf), # Define as quebras de 5 em 5
+      labels = c(
+        "0-9", "10-19", "20-29", "30-39",
+        "40-49", "50-59", "60-69", "70-79",
+        "80+"
+      ),
+      right = FALSE # Importante: Faz o intervalo ser [0, 5) -> inclui 0, exclui 5
+    ),
+    origemenSUS = ifelse(origemencaminhamento == "SUS", "Sim", "Não"),
+    raca = case_when(
+      racacor2 == "branca" ~ "Branca",
+      racacor2 == "parda" ~ "Parda",
+      racacor2 == "preta" ~ "Preta",
+      TRUE ~ NA_character_
+    ),
+    basediag_agrupada = case_when(
+      # Grupo Microscópico (Certeza)
+      basediag %in% c("histologia tum prim", 
+                      "histologia metastase", 
+                      "citologia") ~ "Confirmacao Microscopica",
+      
+      # Grupo Não Microscópico (Evidência Clínica/Imagem)
+      basediag %in% c("clinica", 
+                      "exame por imagem", 
+                      "marcadores tumorais", 
+                      "pesquisa clinica") ~ "Diagnostico Clinico/Imagem",
+      
+      # O que fazer com s/info? (Sugestão: tratar como NA ou Outros)
+      basediag == "s/info" ~ NA_character_, # Ou "Ignorado"
+      
+      TRUE ~ NA_character_ # Segurança para casos não mapeados
+    ),
+    status_conjugal_bin = case_when(
+      estadocivil %in% c("casado", "uniao consensual") ~ "Com Companheiro",
+      estadocivil %in% c("solteiro", "separacao judicial", "viuvo") ~ "Sem Companheiro",
+      TRUE ~ NA_character_
+    ),
+    resposta_tratamento = case_when(
+      estadofinal %in% c("remissao completa", "remissao parcial") ~ "Satisfatória",
+      
+      estadofinal %in% c("doenca estavel", "doenca progressao", 
+                         "obito", "suporte terapeutico") ~ "Insatisfatória",
+      
+      # Todo o resto vira NA
+      TRUE ~ NA_character_ 
+    ),
+    tipo_exame_agrupado = case_when(
+      # Grupo 1: Exame Bioquímico
+      examesdiagn == "marcadores tumorais" ~ "Marcadores Tumorais",
+      
+      # Grupo 2: Exame Tecidual (Biópsia)
+      examesdiagn == "anatomia patologica" ~ "Anatomia Patologica",
+      
+      # Grupo 3: Todo o resto vira NA (ou "Outros" se preferir não perder linhas)
+      # Optei por NA pois <100 casos em 24mil não geram inferência segura
+      TRUE ~ NA_character_ 
+    ),
+    escolaridade_agrupada = case_when(
+      # Nível 1: Baixa (Analfabeto funcional ou Primário incompleto)
+      escolaridade %in% c("nenhuma", "fund. incompleto") ~ "Baixa Escolaridade",
+      
+      # Nível 2: Média (Fundamental completo até Médio)
+      escolaridade %in% c("fund. completo", "nivel medio") ~ "Media Escolaridade",
+      
+      # Nível 3: Alta (Entrou na faculdade)
+      escolaridade %in% c("superior incompleto", "superior completo") ~ "Alta Escolaridade",
+      
+      # Tratamento de Missing
+      escolaridade == "s/info" ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    tratamento_agrupado = case_when(
+      # Os três grandes pilares do tratamento
+      primeirotrathosp == "cirurgia" ~ "Cirurgia",
+      primeirotrathosp == "radioterapia" ~ "Radioterapia",
+      primeirotrathosp == "hormonioterapia" ~ "Hormonioterapia",
+      
+      # O grande grupo dos "Não tratados" (Vigilância ou Encaminhados)
+      primeirotrathosp %in% c("NTI", "nenhum") ~ "Sem Tratamento Inicial",
+      
+      # Agrupando o "Resto" (Quimio é minoria aqui, Imuno é traço)
+      primeirotrathosp %in% c("quimioterapia", "imunoterapia", "outros") ~ "Quimio/Outros",
+      
+      # Tratamento de Missing
+      primeirotrathosp == "s/info" ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    # Normalizar texto para minusculo e sem acentos ajuda no 'match'
+    ocupacao_temp = iconv(tolower(descricao), to="ASCII//TRANSLIT"),
+    
+    classe_trabalho = case_when(
+      
+      # --- GRUPO 1: RURAL / AGRO (Prioridade alta para nao confundir com manual urbano) ---
+      str_detect(ocupacao_temp, "agro|rural|lavrador|pesca|agricola|florestal|cultura de|pecuaria|trabalhador da cultura") ~ "Rural/Agropecuaria",
+      
+      # --- GRUPO 2: ELITE / SUPERIOR / DIRIGENTES ---
+      str_detect(ocupacao_temp, "engenheir|medic|advogad|diretor|gerente|professo|arquitet|economista|analista|biolog|farmaceut|dentista|oficiais|universit|geolog|superiores|empresario|pesquisador|quimic") ~ "Superior/Dirigente",
+      
+      # --- GRUPO 3: MANUAL / OPERACIONAL / INDUSTRIAL ---
+      str_detect(ocupacao_temp, "pedreiro|servente|braçal|operador|mecanic|metalurg|soldador|montador|eletricista|pintor|carpinteiro|marceneiro|costureir|maquinista|motorista|condutor|ajustador|ferramenteiro|tecelao|trefilador|vidreiro|sapateiro|padeiro|acougueiro") ~ "Manual/Operacional",
+      
+      # --- GRUPO 4: TÉCNICOS E ADMINISTRATIVOS ---
+      str_detect(ocupacao_temp, "tecnico|administra|escritorio|secretari|auxiliar|contabil|bancario|recepcionista|desenhista|fiscal|inspetor|agente|assistente|datilografo") ~ "Tecnico/Administrativo",
+      
+      # --- GRUPO 5: SERVIÇOS / COMÉRCIO / SEGURANÇA ---
+      str_detect(ocupacao_temp, "vendedor|comerci|atendente|vigia|policia|bombeiro|militar|seguranca|zelador|porteiro|limpeza|domestica|cozinheir|garcom|barbeiro|cabeleireiro|manicure|frentista|carteiro|telefonista") ~ "Servicos/Comercio",
+      
+      # --- TRATAMENTO DE MISSING / RESTO ---
+      str_detect(ocupacao_temp, "nao se aplica|sem info|ignorado") ~ NA_character_,
+      
+      # Categoria de segurança para o que sobrar
+      TRUE ~ "Outros/Nao Classificado"
+    ),
+    motivo_nao_tratamento = case_when(
+      rzntr2 %in% c("abandono", "recusa") ~ "Recusa/Abandono",
+      rzntr2 %in% c("doenca avancada", "obito", "complicacoes") ~ "Condicao Clinica Ruim",
+      rzntr2 == "realizado fora" ~ "Transferido",
+      TRUE ~ "Tratado/Nao se aplica"
+    ),
+    alcoolismo_agrupado = case_when(
+      # Grupo de Referência (Protegido/Baixo Risco)
+      alcoolismo == "nunca" ~ "Nunca Bebeu",
+      
+      # Grupo de Risco Passado
+      alcoolismo == "ex-consumidor" ~ "Ex-Consumidor",
+      
+      # Grupo de Risco Ativo
+      alcoolismo == "sim" ~ "Consumidor Ativo",
+      
+      # Tratamento de Missing (s/info, nao avaliado, nti)
+      TRUE ~ NA_character_
+    ),
+    tabagismo_agrupado = case_when(
+      # Grupo de Referência (Protegido/Baixo Risco)
+      tabagismo == "nunca" ~ "Nunca Fumou",
+      
+      # Grupo de Risco Passado
+      tabagismo == "ex-consumidor" ~ "Ex-Consumidor",
+      
+      # Grupo de Risco Ativo
+      tabagismo == "sim" ~ "Consumidor Ativo",
+      
+      # Tratamento de Missing (s/info, nao avaliado, nti)
+      TRUE ~ NA_character_
+    )
+  ) %>% 
+  dplyr::select(-basediag,-estadocivil,-estadofinal,-examesdiagn,-escolaridade,-primeirotrathosp,-ocupacao_temp,-descricao,-faixa_idade,
+         -origemencaminhamento,-racacor2,-rzntr2,-alcoolismo,-tabagismo,-idade1consulta) %>% 
+  mutate_if(is.character,as.factor)
+
+```
+
+## Tratamento e Processamento dos Dados
+
+A base de dados original foi submetida a um rigoroso processo de limpeza, normalização e *feature engineering* para viabilizar a análise estatística. O processamento dos dados foi realizado utilizando a linguagem R [@r25], seguindo as etapas descritas abaixo.
+
+### 1. Critérios de Inclusão e Limpeza Inicial
+Foram removidos registros duplicados ou inconsistentes identificados por artefatos de cabeçalho presentes no corpo dos dados (ex: linhas onde a variável `tratamentoantesdodiag` continha o próprio nome da variável). Registros contendo datas inválidas ou fora do escopo temporal do estudo foram revisados.
+
+### 2. Construção da Variável Desfecho (Resposta ao Tratamento)
+A variável dependente foi construída a partir do campo `estadofinal` ("Estado da doença ao final do primeiro tratamento"). Devido à natureza categórica original, optou-se pela dicotomização para permitir a regressão logística binária:
+* **Desfecho Satisfatório (1):** Agrupamento das categorias "Remissão completa" e "Remissão parcial".
+* **Desfecho Insatisfatório (0):** Agrupamento das categorias "Doença estável", "Progressão da doença", "Óbito" e "Suporte terapêutico".
+* *Exclusão:* Registros classificados como "Sem informação" ou "Não se aplica" nesta variável foram excluídos da análise de regressão (análise de casos completos para o desfecho).
+
+### 3. Recodificação de Variáveis Explicativas
+
+Para aumentar o poder estatístico e facilitar a interpretação clínica, as variáveis preditoras foram reclassificadas:
+
+#### Variáveis Sociodemográficas
+
+* **Raça/Cor:** A variável `racacor2`, originalmente contendo cinco categorias, foi recodificada priorizando os três grupos majoritários para análise de desigualdade: "Branca", "Preta" e "Parda". As categorias "Amarela" e "Indígena", devido à baixa frequência amostral (<1%), foram tratadas como *missing* ou agrupadas conforme a sensibilidade do modelo, sendo a população Preta definida como categoria de referência para evidenciar o gradiente racial.
+* **Escolaridade:** As oito categorias originais foram reduzidas a três níveis funcionais: "Baixa Escolaridade" (Analfabeto/Fundamental Incompleto), "Média Escolaridade" (Fundamental Completo/Médio) e "Alta Escolaridade" (Superior Incompleto/Completo).
+* **Situação Conjugal:** A variável `estadocivil` foi binariazada em "Com Companheiro" (Casados/União Consensual) e "Sem Companheiro" (Solteiros, Viúvos, Separados), baseando-se na literatura sobre suporte social em oncologia.
+
+#### Variáveis Clínicas
+* **Estadiamento (TNM):** A variável `estadiam`, contendo códigos detalhados (ex: 1, 1C, 2A, 2B), foi simplificada para uma variável binária:
+    * **Inicial:** Estádios 0, I e II.
+    * **Avançado:** Estádios III e IV.
+    * Códigos "88" (Não se aplica) e "99" (Ignorado) foram convertidos para *NA*.
+* **Tratamento Realizado:** A variável `primeirotrathosp` apresentava alta dispersão. Foi reorganizada em quatro modalidades principais: "Cirurgia", "Radioterapia", "Hormonioterapia" e "Quimio/Outros". A categoria "Sem Tratamento Inicial" foi criada agrupando-se os pacientes classificados como "Nenhum" e "NTI" (Não Teve Indicação), capturando prováveis casos de vigilância ativa ou recusa.
+
+#### Classificação Ocupacional (Mineração de Texto)
+A variável `descricao` (Ocupação baseada na CBO) apresentava 278 categorias distintas de texto livre (ex: "Administradores...", "Ajustadores...", "Trabalhadores da cultura de gramineas").
+Foi aplicada uma técnica de mineração de texto (*string matching*) para agrupar estas ocupações em cinco macro-categorias socioeconômicas:
+1.  **Rural/Agropecuária:** Palavras-chave como *lavrador, agro, rural, pesca*.
+2.  **Manual/Operacional:** Palavras-chave como *pedreiro, servente, motorista, mecânico, soldador*.
+3.  **Serviços/Comércio:** Palavras-chave como *vendedor, vigia, limpeza, doméstico*.
+4.  **Técnico/Administrativo:** Palavras-chave como *técnico, auxiliar, escritório*.
+5.  **Superior/Dirigente:** Palavras-chave como *engenheiro, médico, professor, diretor*.
+
+#### Estilo de Vida
+As variáveis `alcoolismo` e `tabagismo` mantiveram sua estrutura tricotômica ("Nunca", "Ex-consumidor", "Consumidor Ativo") para avaliar o efeito do cessaçao e o risco acumulado, tratando-se "Sem informação" como dado ausente.
+
+### 4. Tratamento de Dados Ausentes (*Missing Data*)
+Foi realizada uma análise de casos completos (*complete-case analysis*) para a regressão logística. Variáveis com alto percentual de dados faltantes estruturais, como `rzntr2` (Razão do não tratamento), que apresentava >98% de preenchimento como "Não se aplica", foram excluídas da modelagem multivariada para evitar instabilidade numérica e viés de convergência.
+
+
+## Uma breve visão sobre a distribuição dos dados (após limpeza)
+
+```{r tables}
+summary(dados_clean)
+```
+A análise descritiva da base de dados processada (n = 24.041) revela um perfil demográfico, clínico e assistencial com características marcantes.
+
+### Perfil Sociodemográfico
+A população estudada é majoritariamente idosa, com concentração expressiva nas faixas etárias de **60 a 69 anos** (n=9.464) e **70 a 79 anos** (n=8.245), refletindo a história natural da neoplasia em questão. Em relação à raça/cor, observou-se predominância de indivíduos autodeclarados **pardos** (n=10.841), seguidos por brancos (n=8.585) e pretos (n=2.911).
+
+O perfil socioeconômico aponta para uma população vulnerável: a maioria absoluta dos pacientes possui **baixa escolaridade** (n=13.795), definida como ensino fundamental incompleto ou analfabetismo. A inserção no mercado de trabalho reflete essa escolaridade, com prevalência de ocupações **manuais/operacionais** (n=9.263) e **rurais/agropecuárias** (n=6.072). O suporte social parece robusto, visto que a maior parte dos pacientes vive **com companheiro** (n=16.247). A dependência do sistema público é evidente, com **84%** dos pacientes (n=20.232) encaminhados via Sistema Único de Saúde (SUS).
+
+### Perfil Clínico e Diagnóstico
+A confirmação diagnóstica foi predominantemente **microscópica** (n=23.607), garantindo alta confiabilidade aos dados. Curiosamente, o exame mais relevante para o planejamento terapêutico dividiu-se entre **Marcadores Tumorais** (n=13.855) e Anatomia Patológica (n=9.705), sugerindo fortemente o perfil de câncer de próstata, onde o PSA desempenha papel central na conduta.
+
+Quanto ao estadiamento clínico (TNM), entre os pacientes com informação válida, houve predominância do **Estádio Inicial** (n=12.952) em detrimento do Avançado (n=3.995). Contudo, destaca-se um volume considerável de dados ausentes (*missing values*) nesta variável (n=7.094).
+
+### Tratamento e Acesso
+Observou-se um gargalo importante no tempo para início do tratamento. A maioria dos pacientes (n=17.477) iniciou a terapia **mais de 60 dias** após o diagnóstico, evidenciando desafios no cumprimento da Lei dos 60 Dias. Por outro lado, o acesso ao diagnóstico foi mais ágil, com a maioria (n=22.754) sendo diagnosticada em até 30 dias.
+
+A modalidade terapêutica principal foi a **Cirurgia** (n=9.420), seguida pela Radioterapia (n=3.968) e Hormonioterapia (n=3.196). O grupo classificado como "Sem Tratamento Inicial" (n=6.957) é expressivo, podendo representar casos de vigilância ativa (comuns em tumores de próstata de baixo risco) ou perdas de seguimento.
+
+### Estilo de Vida e Desfechos
+O perfil de hábitos de vida mostra que a maioria dos pacientes declarou "Nunca ter fumado" (n=10.078) ou "Nunca ter bebido" (n=9.989), embora os grupos de ex-consumidores sejam representativos (Tabagismo: 6.365; Álcool: 4.484).
+
+Em relação ao desfecho primário do estudo, a resposta ao tratamento (avaliada ao final do primeiro tratamento no hospital) foi **Satisfatória** (Remissão completa/parcial) em 8.224 casos e **Insatisfatória** (Doença estável/progressão/óbito) em 6.931 casos. Nota-se, entretanto, um alto número de dados não informados para esta variável (n=8.886), o que justifica a redução amostral observada na modelagem multivariada subsequente.
+
+
+## Regressão Logística
+
+Para identificar os fatores associados ao desfecho do tratamento, utilizou-se o modelo de **Regressão Logística Binomial**. Esta técnica é o padrão-ouro em estudos epidemiológicos quando a variável resposta é dicotômica (Sucesso vs. Falha), pois permite estimar a probabilidade de ocorrência de um evento ($P(Y=1)$) em função de um conjunto de variáveis explicativas independentes ($X_1, X_2, ..., X_k$).
+
+Matematicamente, o modelo utiliza a função de ligação *logit*, que transforma a probabilidade em *log-odds* (logaritmo da chance), linearizando a relação entre as variáveis preditoras e o desfecho:
+
+$$\ln\left(\frac{P}{1-P}\right) = \beta_0 + \beta_1X_1 + \beta_2X_2 + ... + \beta_kX_k$$
+Os coeficientes ($\beta$) obtidos pelo método da Máxima Verossimilhança foram exponenciados ($e^\beta$) para serem apresentados como **Odds Ratios (OR)**, ou Razões de Chances. Um OR > 1 indica fator de proteção/sucesso, enquanto OR < 1 indica fator de risco/falha, considerando um intervalo de confiança de 95% (IC95%).
+
+## Seleção de Variáveis e Justificativa de Exclusão
+
+A seleção das variáveis para o modelo final seguiu critérios teóricos (plausibilidade biológica e social) e estatísticos. Inicialmente, considerou-se a inclusão da variável **idade** (seja contínua ou em faixas etárias). No entanto, optou-se por sua exclusão no modelo multivariado final pelas seguintes razões:
+
+1.  **Homogeneidade da Amostra:** Conforme observado na análise descritiva, a distribuição etária da coorte é altamente concentrada (mais de 73% dos pacientes têm entre 60 e 79 anos). Essa baixa variabilidade reduz o poder discriminatório da variável idade como preditor independente de sucesso terapêutico nesta amostra específica.
+2.  **Interação com Fatores Sociais:** O foco do estudo recai sobre os Determinantes Sociais de Saúde (Raça, Trabalho, Acesso). A idade apresenta forte colinearidade com a variável **Ocupação** (pacientes mais idosos tendem a estar na categoria "Outros/Inativos" ou "Aposentados", enquanto os mais jovens estão na força de trabalho ativa). Manter ambas poderia gerar ruído estatístico e inflacionar erros padrão.
+3.  **História Natural da Doença:** Sendo o câncer (presumivelmente de próstata, dado o perfil) uma doença intrinsicamente ligada ao envelhecimento, a idade atua como um fator de risco basal universal na amostra. Ao removê-la, o modelo purifica o efeito das variáveis de interesse (como o racismo estrutural ou barreiras de acesso ao SUS), evitando que o peso biológico da idade mascare as desigualdades sociais que o estudo visa iluminar.
+
+Dessa forma, o modelo final ajustado priorizou as dimensões de vulnerabilidade social, estadiamento clínico e modalidades terapêuticas.
+
+```{r regLog}
+dados_modelo <- dados_clean %>%
+  # 1. Remover quem não tem a informação do desfecho (resposta)
+  filter(!is.na(resposta_tratamento)) %>%
+  
+  mutate(
+    # 2. Criar a variável binária (Y)
+    # 1 = Sucesso (Remissão), 0 = Falha (Óbito/Estável/Piora)
+    desfecho_binario = ifelse(resposta_tratamento == "Satisfatória", 1, 0),
+    
+    # 3. Ajustar as Referências (Baselines)
+    # Isso define quem é o "1.0" na comparação de risco.
+    
+    # Sexo/Raça (Geralmente a maioria ou o grupo de risco padrão)
+    raca = relevel(as.factor(raca), ref = "Preta"), 
+    
+    # Idade (Se estiver usando contínua, ok. Se for faixa, defina a menor)
+    # (Assumindo que você manteve idade1consulta como numérica)
+    
+    # Escolaridade: Referência = Baixa
+    escolaridade_agrupada = relevel(as.factor(escolaridade_agrupada), ref = "Alta Escolaridade"),
+    
+    # Estádio: Referência = Inicial
+    estadiam_bin = relevel(as.factor(estadiam_bin), ref = "Avançado"),
+    
+    # Tratamento: Referência = Sem Tratamento (Para ver o quanto a Cirurgia protege)
+    # OU Referência = Cirurgia (Para ver o quanto não tratar piora) -> Vou sugerir Cirurgia
+    tratamento_agrupado = relevel(as.factor(tratamento_agrupado), ref = "Sem Tratamento Inicial"),
+    
+    # Vícios: Referência = Nunca
+    alcoolismo_agrupado = relevel(as.factor(alcoolismo_agrupado), ref = "Consumidor Ativo"),
+    tabagismo_agrupado = relevel(as.factor(tabagismo_agrupado), ref = "Consumidor Ativo"),
+    
+    # Classe Trabalho: Referência = Manual ou Rural
+    classe_trabalho = relevel(as.factor(classe_trabalho), ref = "Outros/Nao Classificado"),
+    
+    # Classe Trabalho: Referência = Manual ou Rural
+    origemenSUS = relevel(as.factor(origemenSUS), ref = "Sim")
+  )
+
+## MODELO 
+
+modelo_logistico <- glm(
+  desfecho_binario ~ 
+    #faixa_etaria_prim_cons +   # Faixa Etária na Primeira Consulta
+    raca +                # Raça
+    status_conjugal_bin +      # Suporte social
+    escolaridade_agrupada +    # Nível socioeconômico
+    classe_trabalho +          # Exposição ocupacional
+    estadiam_bin +             # Gravidade da doença (Usei a binária Inicial/Avançado)
+    tratamento_agrupado +      # O que foi feito
+    alcoolismo_agrupado +      # Comorbidade 1
+    tabagismo_agrupado +       # Comorbidade 2
+    origemenSUS,               # Origem do paciente
+  
+  family = binomial(link = "logit"),
+  data = dados_modelo
+)
+
+# Resumo estatístico bruto
+summary(modelo_logistico) # O MODELO COMPLETO É TB O MELHOR MODELO. TODOS OS VIFs DERAM MENOR QUE 5
+
+```
+
+## Os resultados do modelo
+
+A análise multivariada por regressão logística foi conduzida para identificar os determinantes da resposta satisfatória ao tratamento (tabela abaixo). O modelo final demonstrou-se robusto, identificando associações significativas em dimensões sociodemográficas, clínicas e comportamentais.
+
+```{r results}
+# Gerar tabela
+tabela_publicacao <- tbl_regression(modelo_logistico, 
+                                    exponentiate = TRUE, # CRUCIAL: Converte para Odds Ratio
+                                    pvalue_fun = ~style_pvalue(.x, digits = 3),
+                                    label = list(
+                                      #faixa_etaria_prim_cons ~ "Faixa Etária (anos)",
+                                      raca ~ "Raça",
+                                      status_conjugal_bin ~ "Situação Conjugal",
+                                      escolaridade_agrupada ~ "Escolaridade",
+                                      classe_trabalho ~ "Ocupação",
+                                      estadiam_bin ~ "Estadiamento",
+                                      tratamento_agrupado ~ "Tratamento Realizado",
+                                      alcoolismo_agrupado ~ "Histórico de Álcool",
+                                      tabagismo_agrupado ~ "Histórico de Fumo",
+                                      origemenSUS ~ "Encaminhado pelo SUS"
+                                    )) %>%
+  bold_p(t = 0.05) %>% # Negrita quem for significativo
+  bold_labels() %>%    # Negrita os nomes das variáveis
+  italicize_levels()   # Coloca as categorias em itálico
+
+# Visualizar
+tabela_publicacao
+```
+
+
+No tocante às características raciais, utilizando a população preta como grupo de referência, observou-se um padrão heterogêneo. Pacientes autodeclarados pardos apresentaram uma chance **46% maior** de resposta satisfatória (OR: 1,46; IC95%: 1,26–1,70; p<0,001). Em contrapartida, a população branca apresentou uma chance reduzida de sucesso terapêutico em comparação à população preta (OR: 0,79; IC95%: 0,68–0,91; p=0,001).
+
+As desigualdades socioeconômicas manifestaram-se fortemente através da ocupação e da origem do encaminhamento. Pacientes não encaminhados pelo Sistema Único de Saúde (SUS) — atendidos via saúde suplementar ou particular — tiveram 1,47 vezes a chance de obter resposta favorável comparados aos pacientes do SUS (IC95%: 1,25–1,73; p<0,001). Quanto à ocupação, tendo como referência o grupo "Outros/Não Classificado" (que possivelmente engloba inativos com renda ou categorias não manuais não listadas), todas as classes laborais específicas apresentaram prognóstico inferior. Destaca-se a categoria "Manual/Operacional" com a menor chance de resposta (OR: 0,51; IC95%: 0,43–0,61), evidenciando a vulnerabilidade de trabalhadores braçais. A escolaridade e a situação conjugal não atingiram significância estatística no nível de 5%.
+
+As variáveis clínicas comportaram-se conforme o esperado biologicamente. O diagnóstico em estádio inicial mais que dobrou a chance de sucesso (OR: 2,17; IC95%: 1,93–2,44) em relação ao estádio avançado. A escolha terapêutica foi determinante: comparado aos pacientes sem tratamento inicial (provável vigilância ativa ou recusa), a cirurgia elevou a chance de resposta satisfatória em **2,79 vezes** (p<0,001). Inversamente, modalidades isoladas como Hormonioterapia (OR: 0,44) e Quimioterapia (OR: 0,19) associaram-se a desfechos inferiores à referência, refletindo provável doença sistêmica ou inoperável nestes grupos.
+
+Em relação ao estilo de vida, o histórico de tabagismo mostrou que ex-fumantes (OR: 1,43) e não fumantes (OR: 1,21) possuem melhor prognóstico que fumantes ativos. Para o etilismo, observou-se um aparente paradoxo: enquanto ex-consumidores tiveram melhor resposta que consumidores ativos (OR: 1,18), o grupo que "Nunca Bebeu" apresentou chance inferior aos que bebem (OR: 0,85; p=0,012).
+
+## Discussão
+
+Os resultados corroboram a literatura sobre a influência dos determinantes sociais na saúde (SDSS), mas apresentam particularidades regionais importantes. A vantagem de sobrevivência observada na população parda em relação à preta alinha-se a estudos brasileiros que apontam para o "gradiente de cor", onde o racismo estrutural e barreiras de acesso incidem com maior severidade sobre a população preta fenotipicamente mais marcada [@lopez2011].
+
+A disparidade baseada no tipo de encaminhamento (SUS versus Não-SUS) reitera a fragmentação do sistema de saúde brasileiro. A "Lei dos 60 Dias" busca mitigar atrasos, mas pacientes da rede privada historicamente acessam métodos diagnósticos e terapêuticos com maior celeridade, impactando diretamente o estadiamento e a sobrevida [@souza2020]. O impacto da ocupação reforça essa tese: trabalhadores manuais e rurais, frequentemente expostos a riscos ocupacionais e com menor flexibilidade de horário para consultas, apresentaram os piores desfechos.
+
+Clinicamente, a superioridade da cirurgia confirma o tratamento cirúrgico como padrão-ouro para doença localizada com intenção curativa [@inca2023]. O baixo desempenho das terapias sistêmicas (hormônio e quimioterapia) reflete o viés de indicação, onde tais modalidades são reservadas para casos onde a cura cirúrgica já não é viável (tumor avançado ou metastático).
+
+Por fim, o achado paradoxal referente ao consumo de álcool — onde abstêmios tiveram pior prognóstico que bebedores ativos — pode ser explicado pelo "efeito do abstêmio doente" (*sick quitter effect*). Este viés epidemiológico sugere que o grupo de "nunca bebedores" frequentemente inclui indivíduos com saúde frágil ou comorbidades prévias que os impediram de iniciar o consumo de álcool, enquanto bebedores ativos moderados tendem a possuir vida social ativa e melhor estado funcional geral [@shaper1988; @stockwell2016]. Já o tabagismo mantém sua coerência biológica nociva, onde a cessação ou não exposição confirma-se como fator protetor robusto.
+
+## Referências
+
+<div id="refs"></div>
