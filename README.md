@@ -1,6 +1,6 @@
 # Tempo para início do tratamento oncológico de neoplasia de próstata no Sistema Único de Saúde (Minas Gerais, 2014-2019)
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.SEU_NUMERO_AQUI.svg)](https://doi.org/10.5281/zenodo.SEU_NUMERO_AQUI)
+[![DOI](https://zenodo.org/badge/1173723046.svg)](https://doi.org/10.5281/zenodo.18890406)
 [![R](https://img.shields.io/badge/R-4.0+-blue.svg)](https://www.r-project.org/)
 [![Status](https://img.shields.io/badge/Status-Submetido_RESS-brightgreen.svg)]()
 
